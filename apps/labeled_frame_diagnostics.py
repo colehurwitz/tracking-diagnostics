@@ -27,10 +27,14 @@ preceded by "--model_names":
 optionally, a data config file can be specified from the command line
 > streamlit run /path/to/labeled_frame_diagnostics.py -- --data_cfg=/path/to/cfg.yaml
 
+Notes:
+    - this file should only contain the streamlit logic for the user interface
+    - data processing should come from (cached) functions imported from diagnsotics.reports
+    - plots should come from (non-cached) functions imported from diagnostics.visualizations
+
 """
 
 import argparse
-from datetime import datetime
 import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
@@ -45,25 +49,13 @@ import os
 from typing import List, Dict, Tuple, Optional
 import yaml
 
-from lightning_pose.losses.losses import PCALoss
-from lightning_pose.utils.io import return_absolute_data_paths
-from lightning_pose.utils.scripts import (
-    get_imgaug_transform, get_dataset, get_data_module, get_loss_factories,
-)
-
-from diagnostics.reports import generate_report_labeled
-from diagnostics.streamlit import get_df_box, get_df_scatter
-from diagnostics.streamlit import build_pca_loss_object
-from diagnostics.streamlit import concat_dfs
-from diagnostics.streamlit import compute_metric_per_dataset
-from diagnostics.streamlit import update_single_file, update_file_list
-from diagnostics.visualizations import make_seaborn_catplot, get_y_label
-from diagnostics.visualizations import \
-    pix_error_key, conf_error_key, temp_norm_error_key, pcamv_error_key, pcasv_error_key
+from diagnostics.reports import concat_dfs, build_metrics_df, get_df_box, get_df_scatter
+from diagnostics.reports import ReportGenerator, generate_report_labeled
+from diagnostics.streamlit_utils import update_single_file, update_file_list
+from diagnostics.visualizations import make_seaborn_catplot, make_plotly_scatterplot, get_y_label
 
 # TODO
 # - refactor df making
-# - save as pdf / eps
 # - show image on hover?
 
 
@@ -98,7 +90,7 @@ def run():
     st.sidebar.header("Data Settings")
 
     # select ground truth label file from file system
-    label_file_: list = st.sidebar.file_uploader(
+    label_file_: str = st.sidebar.file_uploader(
         "Choose CSV file with labeled data", accept_multiple_files=False, type="csv",
     )
     # check to see if a label file was provided externally via cli arg
@@ -116,8 +108,6 @@ def run():
     # col wrap when plotting results from all keypoints
     n_cols = 3
 
-    metric_options = [pix_error_key]
-
     if label_file is not None and len(prediction_files) > 0:  # otherwise don't try to proceed
 
         # ---------------------------------------------------
@@ -125,7 +115,6 @@ def run():
         # ---------------------------------------------------
 
         # read dataframes into a dict with keys=filenames
-        # dframe_gt = load_df(label_file, header=[1, 2], index_col=0)
         dframe_gt = pd.read_csv(label_file, header=[1, 2], index_col=0)
         if not isinstance(label_file, Path):
             label_file.seek(0)  # reset buffer after reading
@@ -150,10 +139,8 @@ def run():
                 prediction_file.seek(0)  # reset buffer after reading
             dframes[filename] = dframe
             data_types = dframe.iloc[:, -1].unique()
-            # if dframes[prediction_file.name].keys()[-1][0] != "set":
-            #     raise ValueError("Final column of %s must use \"set\" header" % prediction_file.name)
 
-        # edit modelnames if desired, to simplify plotting
+        # edit model names if desired, to simplify plotting
         st.sidebar.write("Model display names (editable)")
         new_names = []
         og_names = list(dframes.keys())
@@ -165,13 +152,7 @@ def run():
         for n_name, o_name in zip(new_names, og_names):
             dframes[n_name] = dframes.pop(o_name)
 
-        # concat dataframes, collapsing hierarchy and making df fatter.
-        df_concat, keypoint_names = concat_dfs(dframes)
-
-        # ---------------------------------------------------
-        # compute metrics
-        # ---------------------------------------------------
-
+        # upload config file
         uploaded_cfg_: str = st.sidebar.file_uploader(
             "Select data config yaml (optional, for pca losses)", accept_multiple_files=False,
             type=["yaml", "yml"]
@@ -186,25 +167,16 @@ def run():
         else:
             cfg = None
 
-        big_df = {}
-        big_df[pix_error_key] = compute_metric_per_dataset(
-            dfs=dframes, metric="rmse", keypoint_names=keypoint_names, labels=dframe_gt)
-        if cfg is not None and cfg.data.get("mirrored_column_matches", None):
-            cfg_pcamv = cfg.copy()
-            cfg_pcamv.model.losses_to_use = ["pca_multiview"]
-            pcamv_loss = build_pca_loss_object(cfg_pcamv)
-            big_df[pcamv_error_key] = compute_metric_per_dataset(
-                dfs=dframes, metric="pca_mv", keypoint_names=keypoint_names, cfg=cfg_pcamv,
-                pca_loss=pcamv_loss)
-            metric_options += [pcamv_error_key]
-        if cfg is not None and cfg.data.get("columns_for_singleview_pca", None):
-            cfg_pcasv = cfg.copy()
-            cfg_pcasv.model.losses_to_use = ["pca_singleview"]
-            pcasv_loss = build_pca_loss_object(cfg_pcasv)
-            big_df[pcasv_error_key] = compute_metric_per_dataset(
-                dfs=dframes, metric="pca_sv", keypoint_names=keypoint_names, cfg=cfg_pcasv,
-                pca_loss=pcasv_loss)
-            metric_options += [pcasv_error_key]
+        # ---------------------------------------------------
+        # compute metrics
+        # ---------------------------------------------------
+
+        # concat dataframes, collapsing hierarchy and making df fatter.
+        df_concat, keypoint_names = concat_dfs(dframes)
+        df_metrics = build_metrics_df(
+            dframes=dframes, keypoint_names=keypoint_names, is_video=False, cfg=cfg,
+            dframe_gt=dframe_gt)
+        metric_options = list(df_metrics.keys())
 
         # ---------------------------------------------------
         # user options
@@ -233,9 +205,8 @@ def run():
         plot_scale = st.radio("Select y-axis scale", scale_options)
 
         # filter data
-        big_df_filtered = big_df[metric_to_plot][big_df[metric_to_plot].set == data_type]
-        n_frames_per_dtype = big_df_filtered.shape[0] // len(prediction_files)
-        # print(big_df[metric_to_plot].head())
+        df_metrics_filt = df_metrics[metric_to_plot][df_metrics[metric_to_plot].set == data_type]
+        n_frames_per_dtype = df_metrics_filt.shape[0] // len(prediction_files)
 
         # plot data
         title = '%s (%i %s frames)' % (keypoint_to_plot, n_frames_per_dtype, data_type)
@@ -244,7 +215,7 @@ def run():
 
         if keypoint_to_plot == "ALL":
 
-            df_box = get_df_box(big_df_filtered, keypoint_names, new_names)
+            df_box = get_df_box(df_metrics_filt, keypoint_names, new_names)
             sns.set_context("paper")
             fig_box = sns.catplot(
                 x="model_name", y="value", col="keypoint", col_wrap=n_cols, sharey=False,
@@ -258,7 +229,7 @@ def run():
         else:
 
             fig_box = make_seaborn_catplot(
-                x="model_name", y=keypoint_to_plot, data=big_df_filtered, x_label="Model Name",
+                x="model_name", y=keypoint_to_plot, data=df_metrics_filt, x_label="Model Name",
                 y_label=y_label, title=title, log_y=log_y, plot_type=plot_type)
             st.pyplot(fig_box)
 
@@ -272,34 +243,22 @@ def run():
         model_1 = st.selectbox(
             "Model 1 (y-axis):", [n for n in new_names if n != model_0], key="model_1")
 
-        df_tmp0 = big_df[metric_to_plot][big_df[metric_to_plot].model_name == model_0]
-        df_tmp1 = big_df[metric_to_plot][big_df[metric_to_plot].model_name == model_1]
+        df_tmp0 = df_metrics[metric_to_plot][df_metrics[metric_to_plot].model_name == model_0]
+        df_tmp1 = df_metrics[metric_to_plot][df_metrics[metric_to_plot].model_name == model_1]
 
         plot_scatter_scale = st.radio("Select axes scale", ["linear", "log"])
-        log_scatter = False if plot_scatter_scale == "linear" else True
-
-        xlabel_ = "%s (%s)" % (y_label, model_0)
-        ylabel_ = "%s (%s)" % (y_label, model_1)
 
         if keypoint_to_plot == "ALL":
 
             df_scatter = get_df_scatter(
                 df_tmp0, df_tmp1, data_type, [model_0, model_1], keypoint_names)
-
-            fig_scatter = px.scatter(
-                df_scatter,
-                x=model_0, y=model_1,
-                facet_col="keypoint", facet_col_wrap=n_cols,
-                log_x=log_scatter, log_y=log_scatter,
-                opacity=0.5,
-                hover_data=['img_file'],
-                # trendline="ols",
-                title=title,
-                labels={model_0: xlabel_, model_1: ylabel_},
+            fig_scatter = make_plotly_scatterplot(
+                model_0=model_0, model_1=model_1, df=df_scatter,
+                metric_name=y_label, title=title,
+                axes_scale=plot_scatter_scale,
+                facet_col="keypoint", n_cols=n_cols, hover_data=["img_file"],
+                fig_height=300 * np.ceil(len(keypoint_names) / n_cols), fig_width=900,
             )
-
-            fig_width = 900
-            fig_height = 300 * np.ceil(len(keypoint_names) / n_cols)
 
         else:
 
@@ -308,26 +267,14 @@ def run():
                 model_1: df_tmp1[keypoint_to_plot][df_tmp1.set == data_type],
                 "img_file": df_tmp0.img_file[df_tmp0.set == data_type]
             })
-            fig_scatter = px.scatter(
-                df_scatter,
-                x=model_0, y=model_1,
-                log_x=log_scatter, log_y=log_scatter,
-                opacity=0.5,
-                hover_data=['img_file'],
-                # trendline="ols",
-                title=title,
-                labels={model_0: xlabel_, model_1: ylabel_},
+            fig_scatter = make_plotly_scatterplot(
+                model_0=model_0, model_1=model_1, df=df_scatter,
+                metric_name=y_label, title=title,
+                axes_scale=plot_scatter_scale,
+                hover_data=["img_file"],
+                fig_height=500, fig_width=500,
             )
-            fig_width = 500
-            fig_height = 500
 
-        mn = np.min(df_scatter[[model_0, model_1]].min(skipna=True).to_numpy())
-        mx = np.max(df_scatter[[model_0, model_1]].max(skipna=True).to_numpy())
-        trace = go.Scatter(x=[mn, mx], y=[mn, mx], line_color="black", mode="lines")
-        trace.update(legendgroup="trendline", showlegend=False)
-        fig_scatter.add_trace(trace, row="all", col="all", exclude_empty_subplots=True)
-        fig_scatter.update_layout(title=title, width=fig_width, height=fig_height)
-        fig_scatter.update_traces(marker={'size': 5})
         st.plotly_chart(fig_scatter)
 
         # ---------------------------------------------------
@@ -336,11 +283,9 @@ def run():
         st.subheader("Generate diagnostic report")
 
         # select save directory
-        run_date_time = datetime.today().strftime('%Y-%m-%d_%H-%M-%S')
-        # save_dir_default = os.path.join(os.getcwd(), run_date_time)
         st.text("current directory: %s" % os.getcwd())
         save_dir_ = st.text_input("Enter path of directory in which to save report")
-        save_dir = os.path.join(save_dir_, "litpose-report-labeled_%s" % run_date_time)
+        save_dir = ReportGenerator.generate_save_dir(base_save_dir=save_dir_, is_video=False)
 
         rpt_save_format = st.selectbox("Select figure format", ["pdf", "png"])
 
@@ -350,31 +295,10 @@ def run():
             etc. will be the same as those selected above. For each metric there will be one 
             overview plot that shows metrics for each individual keypoint, as well as another plot
             that shows the metric averaged across all keypoints.        
-            """)
-
-        # # enumerate plotting options (boxes)
-        # st.markdown("###### Multi-model (catplot) plotting options")
-        # rpt_boxplot_type = st.selectbox(
-        #     "Pick a plot type:", catplot_options, key="boxplot type report")
-        # rpt_boxplot_dtype = st.selectbox(
-        #     "Select data partition:", data_types, key="boxplot dtype report")
-        # rpt_boxplot_scale = st.radio(
-        #     "Select y-axis scale", scale_options, key="boxplot scale report")
-        #
-        # # enumerate plotting options (scatters)
-        # st.markdown("###### Two-model (scatterplot) plotting options")
-        # rpt_scatter_dtype = st.selectbox(
-        #     "Select data partition:", data_types, key="scatter dtype report")
-        # rpt_scatter_scale = st.radio(
-        #     "Select y-axis scale", scale_options, key="scatter scale report")
-        # if len(new_names) > 1:
-        #     idx_0 = int(np.where(np.array(new_names) == model_0)[0][0])
-        #     idx_1 = int(np.where(np.array(new_names) == model_1)[0][0])
-        # else:
-        #     idx_0 = 0
-        #     idx_1 = 0
-        # rpt_model_0 = st.selectbox("Model 0 (x-axis):", new_names, index=idx_0)
-        # rpt_model_1 = st.selectbox("Model 1 (y-axis):", new_names, index=idx_1)
+        
+            **Note**: pca metrics will be computed and plotted when you upload a config yaml in the 
+            left panel
+        """)
 
         rpt_boxplot_type = plot_type
         rpt_boxplot_scale = plot_scale
@@ -387,14 +311,16 @@ def run():
         # enumerate save options
         savefig_kwargs = {}
 
-        submit_report = st.button("Generate report")
+        disable_button = True if save_dir_ is None or save_dir_ == "" else False
+        submit_report = st.button("Generate report", disabled=disable_button)
         if submit_report:
+            st.warning("Generating report")
             if "n_submits" not in st.session_state:
                 st.session_state["n_submits"] = 0
             else:
                 st.session_state["n_submits"] = increase_submits(st.session_state["n_submits"])
             generate_report_labeled(
-                df=big_df,
+                df_metrics=df_metrics,
                 keypoint_names=keypoint_names,
                 model_names=new_names,
                 save_dir=save_dir,

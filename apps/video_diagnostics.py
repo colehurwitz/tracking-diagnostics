@@ -24,44 +24,39 @@ preceded by "--model_names":
 optionally, a data config file can be specified from the command line
 > streamlit run /path/to/video_diagnostics.py -- --data_cfg=/path/to/cfg.yaml
 
+Notes:
+    - this file should only contain the streamlit logic for the user interface
+    - data processing should come from (cached) functions imported from diagnsotics.reports
+    - plots should come from (non-cached) functions imported from diagnostics.visualizations
+
 """
 
 import argparse
-from datetime import datetime
-import numpy as np
+import cv2
 from omegaconf import DictConfig
 import os
 import pandas as pd
 from pathlib import Path
-import plotly.express as px
-import seaborn as sns
 import streamlit as st
-from typing import List, Dict, Tuple, Optional
 import yaml
 
-from diagnostics.reports import generate_report_video
-from diagnostics.streamlit import get_col_names
-from diagnostics.streamlit import concat_dfs
-from diagnostics.streamlit import compute_metric_per_dataset
-from diagnostics.streamlit import build_pca_loss_object
-from diagnostics.streamlit import update_single_file, update_file_list
-from diagnostics.visualizations import make_seaborn_catplot, get_y_label, plot_traces
-from diagnostics.visualizations import \
-    conf_error_key, temp_norm_error_key, pcamv_error_key, pcasv_error_key
+from diagnostics.reports import build_metrics_df, concat_dfs, generate_report_video, get_col_names
+from diagnostics.reports import ReportGenerator
+from diagnostics.streamlit_utils import update_single_file, update_file_list
+from diagnostics.visualizations import get_y_label
+from diagnostics.visualizations import make_seaborn_catplot, make_plotly_catplot, plot_traces
 
 
-def make_plotly_catplot(x, y, data, x_label, y_label, title, plot_type="box"):
-
-    if plot_type == "box":
-        fig = px.box(data, x=x, y=y)
-        fig.update_layout(yaxis_title=y_label, xaxis_title=x_label, title=title)
-    elif plot_type == "hist":
-        fig = px.histogram(
-            data, x=x, color="model_name", marginal="rug", barmode="overlay",
-        )
-        fig.update_layout(yaxis_title=y_label, xaxis_title=x_label, title=title)
-
-    return fig
+@st.cache(allow_output_mutation=True)
+def update_video_file(curr_file, new_file_list):
+    """Cannot use `update_single_file` for both or there will be cache collisons."""
+    if curr_file is None and len(new_file_list) > 0:
+        # pull file from cli args; wrap in Path so that it looks like an UploadedFile object
+        # returned by streamlit's file_uploader
+        ret_file = Path(new_file_list[0])
+    else:
+        ret_file = curr_file
+    return ret_file
 
 
 def increase_submits(n_submits=0):
@@ -86,9 +81,6 @@ def run():
     )
     # check to see if a prediction files were provided externally via cli arg
     uploaded_files, using_cli_preds = update_file_list(uploaded_files_, args.prediction_files)
-
-    metric_options = []
-    big_df = {}
 
     if len(uploaded_files) > 0:  # otherwise don't try to proceed
 
@@ -116,7 +108,7 @@ def run():
             if not isinstance(uploaded_file, Path):
                 uploaded_file.seek(0)  # reset buffer after reading
 
-        # edit modelnames if desired, to simplify plotting
+        # edit model names if desired, to simplify plotting
         st.sidebar.write("Model display names (editable)")
         new_names = []
         og_names = list(dframes.keys())
@@ -128,12 +120,7 @@ def run():
         for n_name, o_name in zip(new_names, og_names):
             dframes[n_name] = dframes.pop(o_name)
 
-        # concat dataframes, collapsing hierarchy and making df fatter.
-        df_concat, keypoint_names = concat_dfs(dframes)
-
-        # ---------------------------------------------------
-        # compute metrics
-        # ---------------------------------------------------
+        # upload config file
         uploaded_cfg_: str = st.sidebar.file_uploader(
             "Select data config yaml (optional, for pca losses)", accept_multiple_files=False,
             type=["yaml", "yml"],
@@ -148,35 +135,29 @@ def run():
         else:
             cfg = None
 
-        # confidence
-        big_df[conf_error_key] = compute_metric_per_dataset(
-            dfs=dframes, metric="confidence", keypoint_names=keypoint_names)
-        metric_options += [conf_error_key]
+        # upload video file
+        # video_file_: str = st.sidebar.file_uploader(
+        #     "Choose video file corresponding to predictions (optional, for labeled video)",
+        #     accept_multiple_files=False,
+        #     type="mp4",
+        # )
+        # TODO: cannot currently upload video from file explorer, doesn't return filepath
+        # opencv VideoCapture cannot read a relative path or a BytesIO object
+        video_file_ = None
+        # check to see if a video file was provided externally via cli arg
+        video_file = update_video_file(video_file_, args.video_file)
+        if isinstance(video_file, Path):
+            video_file = str(video_file)
 
-        # temporal norm
-        big_df[temp_norm_error_key] = compute_metric_per_dataset(
-            dfs=dframes, metric="temporal_norm", keypoint_names=keypoint_names)
-        metric_options += [temp_norm_error_key]
+        # ---------------------------------------------------
+        # compute metrics
+        # ---------------------------------------------------
 
-        # pca multiview
-        if cfg is not None and cfg.data.get("mirrored_column_matches", None):
-            cfg_pcamv = cfg.copy()
-            cfg_pcamv.model.losses_to_use = ["pca_multiview"]
-            pcamv_loss = build_pca_loss_object(cfg_pcamv)
-            big_df[pcamv_error_key] = compute_metric_per_dataset(
-                dfs=dframes, metric="pca_mv", keypoint_names=keypoint_names, cfg=cfg_pcamv,
-                pca_loss=pcamv_loss)
-            metric_options += [pcamv_error_key]
-
-        # pca singleview
-        if cfg is not None and cfg.data.get("columns_for_singleview_pca", None):
-            cfg_pcasv = cfg.copy()
-            cfg_pcasv.model.losses_to_use = ["pca_singleview"]
-            pcasv_loss = build_pca_loss_object(cfg_pcasv)
-            big_df[pcasv_error_key] = compute_metric_per_dataset(
-                dfs=dframes, metric="pca_sv", keypoint_names=keypoint_names, cfg=cfg_pcasv,
-                pca_loss=pcasv_loss)
-            metric_options += [pcasv_error_key]
+        # concat dataframes, collapsing hierarchy and making df fatter.
+        df_concat, keypoint_names = concat_dfs(dframes)
+        df_metrics = build_metrics_df(
+            dframes=dframes, keypoint_names=keypoint_names, is_video=True, cfg=cfg)
+        metric_options = list(df_metrics.keys())
 
         # ---------------------------------------------------
         # plot diagnostics
@@ -189,12 +170,11 @@ def run():
         y_label = get_y_label(metric_to_plot)
 
         # plot diagnostic averaged overall all keypoints
-        plot_type = st.selectbox(
-            "Select a plot type:", ["boxen", "box", "bar", "violin", "strip"], key="plot_type")
-        plot_scale = st.radio("Select y-axis scale", ["linear", "log"], key="plot_scale")
+        plot_type = st.selectbox("Select a plot type:", catplot_options, key="plot_type")
+        plot_scale = st.radio("Select y-axis scale", scale_options, key="plot_scale")
         log_y = False if plot_scale == "linear" else True
         fig_cat = make_seaborn_catplot(
-            x="model_name", y="mean", data=big_df[metric_to_plot], log_y=log_y, x_label=x_label,
+            x="model_name", y="mean", data=df_metrics[metric_to_plot], log_y=log_y, x_label=x_label,
             y_label=y_label, title="Average over all keypoints", plot_type=plot_type)
         st.pyplot(fig_cat)
 
@@ -202,45 +182,29 @@ def run():
         keypoint_to_plot = st.selectbox(
             "Select a keypoint:", pd.Series([*keypoint_names, "mean"]), key="keypoint_to_plot",
         )
-
         # show boxplot per keypoint
         fig_box = make_plotly_catplot(
-            x="model_name", y=keypoint_to_plot, data=big_df[metric_to_plot], x_label=x_label,
+            x="model_name", y=keypoint_to_plot, data=df_metrics[metric_to_plot], x_label=x_label,
             y_label=y_label, title=keypoint_to_plot, plot_type="box")
         st.plotly_chart(fig_box)
-
         # show histogram per keypoint
         fig_hist = make_plotly_catplot(
-            x=keypoint_to_plot, y=None, data=big_df[metric_to_plot], x_label=y_label,
+            x=keypoint_to_plot, y=None, data=df_metrics[metric_to_plot], x_label=y_label,
             y_label="Frame count", title=keypoint_to_plot, plot_type="hist"
         )
         st.plotly_chart(fig_hist)
 
-        # # print(big_df[metric_to_plot].head())
-        # df_tmp = big_df[metric_to_plot].melt(id_vars="model_name")
-        # # print(df_tmp.head())
-        # # print(df_tmp.columns)
-        # fig_cat2 = sns.catplot(data=df_tmp, x="model_name", y="value", col="variable", col_wrap=3)
-        # fig_cat2.set(yscale=plot_scale)
-        # st.pyplot(fig_cat2)
-
         # ---------------------------------------------------
         # plot traces
         # ---------------------------------------------------
-
         st.header("Trace diagnostics")
-
-        # display_head = st.checkbox("Display trace DataFrame")
-        # if display_head:
-        #     st.write("Concatenated Dataframe:")
-        #     st.write(df_concat.head())
 
         models = st.multiselect(
             "Select models:", pd.Series(list(dframes.keys())), default=list(dframes.keys())
         )
         keypoint = st.selectbox("Select a keypoint:", pd.Series(keypoint_names))
         cols = get_col_names(keypoint, "x", models)
-        fig_traces = plot_traces(big_df, df_concat, cols)
+        fig_traces = plot_traces(df_metrics, df_concat, cols)
         st.plotly_chart(fig_traces)
 
         # ---------------------------------------------------
@@ -249,13 +213,22 @@ def run():
         st.subheader("Generate diagnostic report")
 
         # select save directory
-        run_date_time = datetime.today().strftime('%Y-%m-%d_%H-%M-%S')
-        # save_dir_default = os.path.join(os.getcwd(), run_date_time)
         st.text("current directory: %s" % os.getcwd())
         save_dir_ = st.text_input("Enter path of directory in which to save report")
-        save_dir = os.path.join(save_dir_, "litpose-report-video_%s" % run_date_time)
+        save_dir = ReportGenerator.generate_save_dir(base_save_dir=save_dir_, is_video=True)
 
         rpt_save_format = st.selectbox("Select figure format", ["pdf", "png"])
+
+        rpt_n_frames = 500
+        rpt_likelihood = 0.05
+        rpt_framerate = 20
+        rpt_single_vids = False
+        if video_file is not None:
+            rpt_n_frames = st.text_input("Number of frames in labeled video (<1000)", rpt_n_frames)
+            rpt_likelihood = st.text_input("Likelihood threshold", rpt_likelihood)
+            rpt_framerate = st.text_input("Labeled video framerate", rpt_framerate)
+            rpt_single_vids = st.checkbox(
+                "Output video for each individual bodypart", rpt_single_vids)
 
         st.markdown("""
             Click the `Generate Report` button below to automatically save out all plots. 
@@ -263,7 +236,12 @@ def run():
             will be the same as those selected above. For each metric there will be one 
             overview plot that shows metrics for each individual keypoint, as well as another plot
             that shows the metric averaged across all keypoints.   
+            
+            **Note**: pca metrics will be computed and plotted when you upload a config yaml in the 
+            left panel
         """)
+        # * a labeled video will be created (using the same models whose traces are plotted
+        # above) when you upload the video file in the left panel
 
         rpt_boxplot_type = plot_type
         rpt_boxplot_scale = plot_scale
@@ -272,17 +250,18 @@ def run():
         # enumerate save options
         savefig_kwargs = {}
 
-        submit_report = st.button("Generate report")
+        disable_button = True if save_dir_ is None or save_dir_ == "" else False
+        submit_report = st.button("Generate report", disabled=disable_button)
         if submit_report:
+            st.warning("Generating report")
             if "n_submits" not in st.session_state:
                 st.session_state["n_submits"] = 0
             else:
                 st.session_state["n_submits"] = increase_submits(st.session_state["n_submits"])
             generate_report_video(
                 df_traces=df_concat,
-                df_metrics=big_df,
+                df_metrics=df_metrics,
                 keypoint_names=keypoint_names,
-                model_names=new_names,
                 save_dir=save_dir,
                 format=rpt_save_format,
                 box_kwargs={
@@ -290,9 +269,16 @@ def run():
                     "plot_scale": rpt_boxplot_scale,
                 },
                 trace_kwargs={
-                    "models": rpt_trace_models,
+                    "model_names": rpt_trace_models,
                 },
                 savefig_kwargs=savefig_kwargs,
+                video_kwargs={
+                    "likelihood_thresh": float(rpt_likelihood),
+                    "max_frames": int(rpt_n_frames),
+                    "framerate": float(rpt_framerate),
+                },
+                video_file=video_file,
+                make_video_per_keypoint=rpt_single_vids,
             )
 
         if st.session_state["n_submits"] > 0:
@@ -309,5 +295,6 @@ if __name__ == "__main__":
     parser.add_argument('--prediction_files', action='append', default=[])
     parser.add_argument('--model_names', action='append', default=[])
     parser.add_argument('--data_cfg', action='append', default=[])
+    parser.add_argument('--video_file', action='append', default=[])
 
     run()
