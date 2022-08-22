@@ -45,7 +45,7 @@ def get_frames_from_idxs(cap, idxs):
 
 def make_labeled_video(
         save_file, cap, points, labels=None, likelihood_thresh=0.05, max_frames=None,
-        markersize=6, framerate=20, height=4):
+        markersize=6, framerate=20, height=4, marker_name_plot=None, annotate=False):
     """Behavioral video overlaid with markers.
 
     Parameters
@@ -111,11 +111,15 @@ def make_labeled_video(
         # plot markers
         for p, point_dict in enumerate(points):
             for m, (marker_name, marker_vals) in enumerate(point_dict.items()):
-                if marker_vals[n, 2] < likelihood_thresh:
-                    continue
-                ax.plot(
-                    marker_vals[n, 0], marker_vals[n, 1],
-                    'o', markersize=markersize, color=colors[p], alpha=0.75)
+                if marker_name==marker_name_plot or marker_name_plot is None:
+                    if marker_vals[n, 2] < likelihood_thresh:
+                        continue
+                    ax.plot(
+                        marker_vals[n, 0], marker_vals[n, 1],
+                        'o', markersize=markersize, color=colors[p], alpha=0.75)
+                    if annotate:
+                        ax.annotate(
+                            marker_name, (marker_vals[n, 0]+5, marker_vals[n, 1]+5), color=colors[p], fontsize=7.5)
 
         # add labels
         if labels is not None:
@@ -125,6 +129,8 @@ def make_labeled_video(
 
         # add frame number
         im = ax.text(0.02, 0.98, 'frame %i' % n, **txt_fr_kwargs)
+        if marker_name_plot is not None:
+            im = ax.text(0.02, 0.90, marker_name_plot, **txt_fr_kwargs)
 
         plt.savefig(os.path.join(tmp_dir, 'frame_%06i.jpeg' % n))
 
@@ -140,7 +146,13 @@ def make_labeled_video_wrapper(
         max_frames: Optional[int] = None,
         markersize: int = 6,
         framerate: float = 20,
-        height: float = 4
+        height: float = 4,
+        marker_name_plot: str = None, 
+        annotate: bool = False,
+        x_list = None,
+        y_list = None,
+        confidence_list = None,
+        marker_names_list= None,
     ):
     """
 
@@ -159,8 +171,11 @@ def make_labeled_video_wrapper(
 
     """
     points = []
-    for csv in csvs:
-        xs, ys, ls, marker_names = load_marker_csv(csv)
+    for i, _ in enumerate(csvs):
+        if x_list is not None and y_list is not None and confidence_list is not None and marker_names_list is not None:
+            xs, ys, ls, marker_names = x_list[i], y_list[i], confidence_list[i], marker_names_list[i]
+        else:
+            xs, ys, ls, marker_names = load_marker_csv(csv)
         points_tmp = {}
         for m, marker_name in enumerate(marker_names):
             points_tmp[marker_name] = np.concatenate([
@@ -177,7 +192,7 @@ def make_labeled_video_wrapper(
     make_labeled_video(
         save_file_full, cap, points, model_names,
         likelihood_thresh=likelihood_thresh, max_frames=max_frames, markersize=markersize,
-        framerate=framerate, height=height
+        framerate=framerate, height=height, marker_name_plot=marker_name_plot, annotate=annotate,
     )
 
 
